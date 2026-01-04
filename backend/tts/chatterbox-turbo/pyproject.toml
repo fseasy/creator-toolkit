@@ -1,0 +1,23 @@
+[project]
+name = "chatterbox-turbo"
+version = "0.1.0"
+description = "Chatterbox turbo"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "chatterbox-tts",
+    "httpx[socks]>=0.28.1",
+    "setuptools<81",
+]
+
+[tool.uv.workspace]
+members = [
+    "repo/chatterbox",
+]
+
+[tool.uv.sources]
+chatterbox-tts = { workspace = true, editable = true }
+
+[[tool.uv.index]]
+url = "https://mirrors.aliyun.com/pypi/simple/"
+default = true
