@@ -1,0 +1,3 @@
+[submodule "backend/tts/chatterbox-turbo/repo/chatterbox"]
+	path = backend/tts/chatterbox-turbo/repo/chatterbox
+	url = https://github.com/resemble-ai/chatterbox.git
