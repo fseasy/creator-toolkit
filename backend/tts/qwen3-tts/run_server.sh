@@ -1,3 +1,4 @@
 #!/bin/bash
 
-uv run python main.py
+# --no-sync: avoid run sync when running
+uv run --no-sync python main.py
