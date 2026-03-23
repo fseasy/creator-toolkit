@@ -1,4 +1,17 @@
 
+## 运行依赖
+
+1. prepare model:
+
+   see section `Env build log`, download the `Qwen/Qwen3-TTS-12Hz-0.6B-Base` to `./model-data/Qwen3-TTS-12Hz-0.6B-Base`
+
+2. prepare speaker
+
+   you can call `create-speaker` from fastapi to create new speaker, it will store at `db/speaker`
+
+   in `private-conf/app/creator-toolkit/qwen3-tts`, it stores some preset speakers that used in some project.
+
+
 ## fastapi 接口
 
 package-path：$ROOT/src/fs_qwen3_tts_server
@@ -55,16 +68,23 @@ db-path：$ROOT/db
 
 ## Env build log
 
-modelscope download --model Qwen/Qwen3-TTS-Tokenizer-12Hz  --local_dir ./Qwen3-TTS-Tokenizer-12Hz
-modelscope download --model Qwen/Qwen3-TTS-12Hz-0.6B-Base --local_dir ./Qwen3-TTS-12Hz-0.6B-Base
+1. download model:
+  
+  qwen3-tts: https://github.com/QwenLM/Qwen3-TTS
 
-bf16 with flash-atten 2.8.3
-- warning: You are attempting to use Flash Attention 2 without specifying a torch dtype. This might lead to unexpected behaviour
-- 4.082Gi/12.000Gi
+  ```bash
+  modelscope download --model Qwen/Qwen3-TTS-12Hz-0.6B-Base --local_dir ./model-data/Qwen3-TTS-12Hz-0.6B-Base
+  ```
 
-如果用 float16, 直接报错; 大概率是溢出(nan)
+2. conf setting
 
-如果用 float32
-7.877Gi/12.000Gi
+  bf16 with flash-atten 2.8.3
+  - warning: You are attempting to use Flash Attention 2 without specifying a torch dtype. This might lead to unexpected behaviour
+  - 4.082Gi/12.000Gi
+
+  如果用 float16, 直接报错; 大概率是溢出(nan)
+
+  如果用 float32
+  7.877Gi/12.000Gi
 
 
