@@ -5,7 +5,8 @@ import logging
 from pathlib import Path
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, Response
 
 from fs_qwen3_tts_server.routes import init_app, router
 
@@ -24,11 +25,35 @@ def create_app() -> FastAPI:
   app = FastAPI(
     title="Qwen3-TTS Server",
     description="Voice cloning and batch TTS API using Qwen3-TTS",
-    version="0.1.0",
+    version="1.1.0",
   )
   init_app(db_path=DB_PATH, model_path=MODEL_PATH)
   app.include_router(router)
+
+  app.add_exception_handler(HTTPException, _custom_http_exception_handler)  # type: ignore
+  app.add_exception_handler(Exception, _universal_exception_handler)
+
   return app
+
+
+async def _custom_http_exception_handler(request: Request, exc: HTTPException) -> Response:
+  exc_info = True if exc.status_code >= 500 else None
+  logger.log(logging.WARNING, f"HTTP Error: {exc.status_code} - {exc.detail}", exc_info=exc_info)
+
+  # 返回给客户端原有的格式
+  return JSONResponse(
+    status_code=exc.status_code,
+    content={"detail": exc.detail},
+  )
+
+
+async def _universal_exception_handler(request: Request, exc: Exception):
+  # 这里建议用 logger.exception，因为这是未预料到的系统崩溃
+  logger.exception(f"Unhandled System Error: {str(exc)}")
+  return JSONResponse(
+    status_code=500,
+    content={"detail": f"Internal Server Error, exc={exc}"},
+  )
 
 
 if __name__ == "__main__":

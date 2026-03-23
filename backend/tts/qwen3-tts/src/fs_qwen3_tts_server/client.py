@@ -8,7 +8,7 @@ from pathlib import Path
 
 import httpx
 
-from .models import AudioFormat, BatchTTSRequest, Manifest, TTSRequest, CreateSpeakerResponse
+from .models import AudioFormat, BatchTTSRequest, CreateSpeakerResponse, Manifest, TTSRequest
 
 
 @dataclass
@@ -72,14 +72,18 @@ class Qwen3TTSClient:
       form_data["ref_audio_url"] = ""
     else:
       form_data["ref_audio_url"] = ref_audio_url or ""
-
-    async with httpx.AsyncClient(timeout=self.timeout) as client:
-      response = await client.post(
-        f"{self.base_url}/create-speaker",
-        data=form_data,
-        files=files,  # type: ignore[arg-type]
-      )
-    response.raise_for_status()
+    try:
+      async with httpx.AsyncClient(timeout=self.timeout) as client:
+        response = await client.post(
+          f"{self.base_url}/create-speaker",
+          data=form_data,
+          files=files,  # type: ignore[arg-type]
+        )
+      response.raise_for_status()
+    except httpx.HTTPStatusError as e:
+      raise RuntimeError(
+        f"/create-speaker api get exception: code={e.response.status_code}, detail={e.response.text}"
+      ) from e
     return CreateSpeakerResponse.model_validate(response.json())
 
   async def batch_tts(
@@ -95,13 +99,18 @@ class Qwen3TTSClient:
       languages=languages,
       audio_fmt=audio_fmt,
     )
-
-    async with httpx.AsyncClient(timeout=self.timeout) as client:
-      response = await client.post(
-        f"{self.base_url}/batch-tts",
-        json=request.model_dump(),
-      )
-    response.raise_for_status()
+    try:
+      async with httpx.AsyncClient(timeout=self.timeout) as client:
+        response = await client.post(
+          f"{self.base_url}/batch-tts",
+          json=request.model_dump(),
+        )
+      response.raise_for_status()
+    except httpx.HTTPStatusError as e:
+      # let the exception include the response.text! or you can only get the code.
+      raise RuntimeError(
+        f"/batch-tts api get exception: code={e.response.status_code}, detail={e.response.text}"
+      ) from e
     return BatchTTSResult.from_zip(response.content)
 
   async def tts(
@@ -117,11 +126,13 @@ class Qwen3TTSClient:
       language=language,
       audio_fmt=audio_fmt,
     )
-
-    async with httpx.AsyncClient(timeout=self.timeout) as client:
-      response = await client.post(
-        f"{self.base_url}/tts",
-        json=request.model_dump(),
-      )
-    response.raise_for_status()
+    try:
+      async with httpx.AsyncClient(timeout=self.timeout) as client:
+        response = await client.post(
+          f"{self.base_url}/tts",
+          json=request.model_dump(),
+        )
+      response.raise_for_status()
+    except httpx.HTTPStatusError as e:
+      raise RuntimeError(f"/tts api get exception: code={e.response.status_code}, detail={e.response.text}") from e
     return response.content

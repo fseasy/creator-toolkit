@@ -13,7 +13,7 @@ from fastapi.responses import Response
 from fs_pyutils.audio import audio_to_mp3_bytes
 
 from .cache import SpeakerPromptCache
-from .models import AudioFormat, BatchTTSRequest, Manifest, ManifestItem, TTSRequest, CreateSpeakerResponse
+from .models import AudioFormat, BatchTTSRequest, CreateSpeakerResponse, Manifest, ManifestItem, TTSRequest
 from .serialize import save_prompt_items, save_ref_audio, save_ref_text
 from .tts import TTSEngine
 
