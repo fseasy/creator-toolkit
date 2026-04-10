@@ -1,0 +1,33 @@
+[project]
+name = "dynamic-face-mosaic"
+version = "1.1.0"
+description = "Mask face to mosaic for video and images."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "insightface>=0.7.3",
+  "lap>=0.5.13",
+  "numpy>=2.4.4",
+  "onnxruntime>=1.24.4",
+  "opencv-python>=4.13.0.92",
+  "tqdm>=4.67.3",
+  "ultralytics>=8.4.36",
+]
+
+[[tool.uv.index]]
+url = "https://mirrors.aliyun.com/pypi/simple/"
+default = true
+
+[tool.ruff]
+line-length = 120
+indent-width = 2
+
+
+[tool.ruff.lint]
+# 确保 "I" (isort) 规则在启用列表中
+select = ["E", "F", "B", "UP", "I", "RET"]
+
+[tool.ruff.lint.isort]
+# 这里可以像 isort 一样自定义配置
+force-single-line = false # 是否强制单行导入
+combine-as-imports = true # 是否合并 import as

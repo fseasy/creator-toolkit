@@ -15,7 +15,6 @@ MODEL_FILENAME = "vocals_mel_band_roformer.ckpt"
 MODEL_DIR = WORKSPACE_DIR / "models"
 BASE_OUTPUT_DIR = WORKSPACE_DIR / "output"
 
-
 def ensure_dirs():
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
     BASE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
