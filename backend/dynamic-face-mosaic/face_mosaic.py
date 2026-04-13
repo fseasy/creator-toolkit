@@ -1,20 +1,26 @@
 import argparse
+import datetime
+import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
+from enum import Enum
 from pathlib import Path
 
 import cv2
 import numpy as np
 from tqdm import tqdm
 
+# Suppress YOLO logging if used
+os.environ["YOLO_VERBOSE"] = "False"
 os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
 os.environ.setdefault("MPLCONFIGDIR", str(Path(tempfile.gettempdir()) / "matplotlib"))
 
 # Supported extensions
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
-VID_EXTS = {".mp4", ".mov", ".avi", ".mkv"}
+VID_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 VIDEO_FALLBACK_GRACE_FRAMES = 2
 VIDEO_SMOOTHING_ALPHA = 0.65
 MAX_TRACK_MATCH_DISTANCE_RATIO = 0.35
@@ -24,7 +30,88 @@ MISSED_FRAME_SHRINK_RATIO = 0.92
 MIN_TRACK_MATCH_IOU = 0.05
 
 
+class ModelType(Enum):
+  YOLO = "yolo"
+  SCRFD = "scrfd"
+
+
+def get_device():
+  try:
+    import torch
+
+    if torch.backends.mps.is_available():
+      return "mps"
+  except Exception:
+    pass
+  return "cpu"
+
+
 class FaceObfuscator:
+  """Abstract base for face obfuscators."""
+
+  def process_frame(self, frame: np.ndarray, is_video: bool = False) -> np.ndarray:
+    raise NotImplementedError
+
+
+class YOLOFaceObfuscator(FaceObfuscator):
+  """Uses YOLOv8-face with Object Tracking for maximum stability on Mac."""
+
+  def __init__(self, model_path: Path, padding: float = 0.3):
+    from ultralytics import YOLO
+
+    self.model = YOLO(model_path)
+    self.padding = padding
+    self.device = get_device()
+
+  def process_frame(self, frame: np.ndarray, is_video: bool = False) -> np.ndarray:
+    h, w = frame.shape[:2]
+
+    if is_video:
+      results = self.model.track(
+        frame, persist=True, conf=0.3, iou=0.5, tracker="bytetrack.yaml", verbose=False, device=self.device
+      )
+    else:
+      results = self.model.predict(frame, conf=0.3, verbose=False, device=self.device)
+
+    if not results or len(results[0].boxes) == 0:
+      return frame
+
+    output_frame = frame.copy()
+    boxes = results[0].boxes.xyxy.cpu().numpy()
+
+    for box in boxes:
+      x1, y1, x2, y2 = box.astype(int)
+      bw, bh = x2 - x1, y2 - y1
+
+      px, py = int(bw * self.padding), int(bh * self.padding)
+      nx1, ny1 = max(0, x1 - px), max(0, y1 - py)
+      nx2, ny2 = min(w, x2 + px), min(h, y2 + py)
+
+      output_frame = self._apply_soft_blur(output_frame, nx1, ny1, nx2, ny2)
+
+    return output_frame
+
+  def _apply_soft_blur(self, image: np.ndarray, x1: int, y1: int, x2: int, y2: int) -> np.ndarray:
+    roi = image[y1:y2, x1:x2]
+    if roi.size == 0:
+      return image
+
+    rh, rw = roi.shape[:2]
+    blur_k = int(max(rw, rh) * 0.5) | 1
+    blurred = cv2.GaussianBlur(roi, (blur_k, blur_k), 0)
+
+    mask = np.zeros((rh, rw, 3), dtype=np.float32)
+    cv2.ellipse(mask, (rw // 2, rh // 2), (rw // 2, rh // 2), 0, 0, 360, (1, 1, 1), -1)
+
+    feather_k = int(max(rw, rh) * 0.2) | 1
+    mask = cv2.GaussianBlur(mask, (feather_k, feather_k), 0)
+
+    blended = roi.astype(np.float32) * (1 - mask) + blurred.astype(np.float32) * mask
+    image[y1:y2, x1:x2] = blended.astype(np.uint8)
+    return image
+
+
+class SCRFDFaceObfuscator(FaceObfuscator):
   """Detects faces with InsightFace SCRFD and applies a feathered blur."""
 
   def __init__(
@@ -59,14 +146,13 @@ class FaceObfuscator:
     selected = [provider for provider in preferred if provider in available]
     return selected or ["CPUExecutionProvider"]
 
-  def process_image(self, frame: np.ndarray) -> np.ndarray:
+  def process_frame(self, frame: np.ndarray, is_video: bool = False) -> np.ndarray:
+    if is_video:
+      boxes = self._detect_boxes(frame)
+      stabilized_boxes = self._stabilize_video_boxes(frame.shape, boxes)
+      return self._apply_blur_boxes(frame, stabilized_boxes)
     boxes = self._detect_boxes(frame)
     return self._apply_blur_boxes(frame, boxes)
-
-  def process_video_frame(self, frame: np.ndarray) -> np.ndarray:
-    boxes = self._detect_boxes(frame)
-    stabilized_boxes = self._stabilize_video_boxes(frame.shape, boxes)
-    return self._apply_blur_boxes(frame, stabilized_boxes)
 
   def _detect_boxes(self, frame: np.ndarray) -> list[tuple[int, int, int, int]]:
     faces = self.app.get(frame)
@@ -246,6 +332,184 @@ class FaceObfuscator:
     return image
 
 
+def create_obfuscator(model_type: ModelType, **kwargs) -> FaceObfuscator:
+  if model_type == ModelType.YOLO:
+    return YOLOFaceObfuscator(padding=kwargs.get("padding", 0.3), model_path=kwargs["yolo_model_path"])
+  if model_type == ModelType.SCRFD:
+    return SCRFDFaceObfuscator(
+      model_pack=kwargs["scrfd_model_pack"],
+      model_root=kwargs["scrfd_model_root"],
+      padding=kwargs.get("padding", 0.35),
+      det_size=kwargs.get("det_size", 640),
+      det_thresh=kwargs.get("det_thresh", 0.35),
+    )
+  raise ValueError(f"Unsupported model type: {model_type}")
+
+
+def merge_audio_and_metadata(original_vid: Path, processed_vid: Path, output_vid: Path) -> bool:
+  """利用 FFmpeg 将原视频的音频无损提取并合并到处理后的视频中，并复制 metadata"""
+  cmd = [
+    "ffmpeg",
+    "-y",
+    "-loglevel",
+    "error",
+    "-i",
+    str(processed_vid),
+    "-i",
+    str(original_vid),
+    "-map",
+    "0:v:0",
+    "-map",
+    "1:a?",
+    "-c:v",
+    "copy",
+    "-c:a",
+    "copy",
+    "-map_metadata",
+    "1",
+    "-movflags",
+    "+faststart",
+    "-shortest",
+    str(output_vid),
+  ]
+  result = subprocess.run(cmd, capture_output=True, text=True)
+  if result.returncode == 0:
+    return True
+  print("  [!] Failed to mux original audio with ffmpeg:")
+  stderr = result.stderr.strip()
+  if stderr:
+    print(f"      {stderr}")
+  return False
+
+
+def _parse_exif_datetime(exif_dict: dict) -> datetime.datetime | None:
+  from piexif import ExifIFD, ImageIFD
+
+  candidates = []
+  if ExifIFD.DateTimeOriginal in exif_dict.get("Exif", {}):
+    candidates.append(exif_dict["Exif"][ExifIFD.DateTimeOriginal])
+  if ExifIFD.CreateDate in exif_dict.get("Exif", {}):
+    candidates.append(exif_dict["Exif"][ExifIFD.CreateDate])
+  if ImageIFD.DateTimeDigitized in exif_dict.get("0th", {}):
+    candidates.append(exif_dict["0th"][ImageIFD.DateTimeDigitized])
+  if ImageIFD.DateTime in exif_dict.get("0th", {}):
+    candidates.append(exif_dict["0th"][ImageIFD.DateTime])
+
+  for raw_value in candidates:
+    if not raw_value:
+      continue
+    if isinstance(raw_value, bytes):
+      raw_value = raw_value.decode(errors="ignore")
+    try:
+      return datetime.datetime.strptime(raw_value, "%Y:%m:%d %H:%M:%S")
+    except ValueError:
+      continue
+  return None
+
+
+def _parse_ffprobe_creation_time(raw_value: str) -> datetime.datetime | None:
+  if not raw_value:
+    return None
+  raw_value = raw_value.strip().rstrip("Z")
+  try:
+    return datetime.datetime.fromisoformat(raw_value)
+  except ValueError:
+    pass
+  for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f", "%Y:%m:%d %H:%M:%S"]:
+    try:
+      return datetime.datetime.strptime(raw_value, fmt)
+    except ValueError:
+      continue
+  return None
+
+
+def _get_video_creation_time(src: Path) -> datetime.datetime | None:
+  ffprobe = shutil.which("ffprobe")
+  if ffprobe is None:
+    return None
+  cmd = [
+    ffprobe,
+    "-v",
+    "error",
+    "-print_format",
+    "json",
+    "-show_entries",
+    "format_tags=creation_time:format_tags=encoded_date:stream_tags=creation_time",
+    str(src),
+  ]
+  result = subprocess.run(cmd, capture_output=True, text=True)
+  if result.returncode != 0 or not result.stdout:
+    return None
+  try:
+    info = json.loads(result.stdout)
+  except json.JSONDecodeError:
+    return None
+
+  format_tags = info.get("format", {}).get("tags", {}) or {}
+  if "creation_time" in format_tags:
+    parsed = _parse_ffprobe_creation_time(format_tags["creation_time"])
+    if parsed:
+      return parsed
+  if "encoded_date" in format_tags:
+    parsed = _parse_ffprobe_creation_time(format_tags["encoded_date"].replace("encoder", ""))
+    if parsed:
+      return parsed
+
+  for stream in info.get("streams", []):
+    tags = stream.get("tags", {}) or {}
+    if "creation_time" in tags:
+      parsed = _parse_ffprobe_creation_time(tags["creation_time"])
+      if parsed:
+        return parsed
+  return None
+
+
+def _set_file_times(dst: Path, timestamp: float) -> None:
+  os.utime(dst, (timestamp, timestamp))
+  if sys.platform == "darwin":
+    setfile = shutil.which("SetFile")
+    if setfile is not None:
+      date_str = datetime.datetime.fromtimestamp(timestamp).strftime("%m/%d/%Y %H:%M:%S")
+      subprocess.run([setfile, "-d", date_str, str(dst)], capture_output=True)
+
+
+def copy_image_exif_and_time(src: Path, dst: Path):
+  """Copy EXIF data from src to dst and set file times."""
+  create_time = None
+  try:
+    import piexif
+    from PIL import Image
+
+    img = Image.open(src)
+    exif_bytes = img.info.get("exif", b"")
+    if exif_bytes:
+      exif_dict = piexif.load(exif_bytes)
+      create_dt = _parse_exif_datetime(exif_dict)
+      if create_dt is not None:
+        create_time = create_dt.timestamp()
+      dest_img = Image.open(dst)
+      dest_img.save(dst, exif=exif_bytes)
+  except Exception:
+    pass
+
+  if create_time is None:
+    stat = src.stat()
+    create_time = getattr(stat, "st_birthtime", stat.st_mtime)
+  _set_file_times(dst, create_time)
+
+
+def copy_video_metadata_and_time(src: Path, dst: Path):
+  """For videos, metadata is copied in merge_audio, just set times from metadata."""
+  create_dt = _get_video_creation_time(src)
+  if create_dt is not None:
+    _set_file_times(dst, create_dt.timestamp())
+    return
+
+  stat = src.stat()
+  create_time = getattr(stat, "st_birthtime", stat.st_mtime)
+  _set_file_times(dst, create_time)
+
+
 class MediaProcessor:
   """Reads media, applies face blur, and preserves audio for videos."""
 
@@ -258,8 +522,9 @@ class MediaProcessor:
     if img is None:
       return False
 
-    processed_img = self.obfuscator.process_image(img)
+    processed_img = self.obfuscator.process_frame(img, is_video=False)
     cv2.imwrite(str(out_path), processed_img)
+    copy_image_exif_and_time(in_path, out_path)
     return True
 
   def process_video(self, in_path: Path, out_path: Path) -> bool:
@@ -267,19 +532,19 @@ class MediaProcessor:
     if not cap.isOpened():
       return False
 
-    self.obfuscator.reset_video_state()
+    if hasattr(self.obfuscator, "reset_video_state"):
+      self.obfuscator.reset_video_state()
 
     fps = cap.get(cv2.CAP_PROP_FPS)
     if fps <= 0:
       fps = 30.0
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     out_path = out_path.with_suffix(".mp4")
     temp_video_path = self._temp_video_path(out_path)
 
-    writer = cv2.VideoWriter(str(temp_video_path), fourcc, fps, (w, h))
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    writer = cv2.VideoWriter(str(temp_video_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
     current_frame = 0
 
     try:
@@ -288,7 +553,7 @@ class MediaProcessor:
         if not ret:
           break
 
-        processed = self.obfuscator.process_video_frame(frame)
+        processed = self.obfuscator.process_frame(frame, is_video=True)
         writer.write(processed)
 
         current_frame += 1
@@ -299,58 +564,20 @@ class MediaProcessor:
       cap.release()
       writer.release()
 
-    if not self._mux_original_audio(temp_video_path, in_path, out_path):
+    if not merge_audio_and_metadata(in_path, temp_video_path, out_path):
       if out_path.exists():
         out_path.unlink()
       temp_video_path.replace(out_path)
     elif temp_video_path.exists():
       temp_video_path.unlink()
 
+    copy_video_metadata_and_time(in_path, out_path)
     return True
 
   def _temp_video_path(self, out_path: Path) -> Path:
     fd, temp_name = tempfile.mkstemp(prefix=f"{out_path.stem}.", suffix=".video_only.mp4", dir=out_path.parent)
     os.close(fd)
     return Path(temp_name)
-
-  def _mux_original_audio(self, temp_video_path: Path, source_video_path: Path, out_path: Path) -> bool:
-    if self.ffmpeg is None:
-      print("  [!] ffmpeg not found, output video will be saved without audio.")
-      return False
-
-    cmd = [
-      self.ffmpeg,
-      "-y",
-      "-loglevel",
-      "error",
-      "-i",
-      str(temp_video_path),
-      "-i",
-      str(source_video_path),
-      "-map",
-      "0:v:0",
-      "-map",
-      "1:a?",
-      "-c:v",
-      "copy",
-      "-c:a",
-      "copy",
-      "-map_metadata",
-      "1",
-      "-movflags",
-      "+faststart",
-      "-shortest",
-      str(out_path),
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode == 0:
-      return True
-
-    print("  [!] Failed to mux original audio with ffmpeg:")
-    stderr = result.stderr.strip()
-    if stderr:
-      print(f"      {stderr}")
-    return False
 
 
 def resolve_inputs(inputs: list[Path]) -> list[tuple[Path, Path]]:
@@ -366,22 +593,8 @@ def resolve_inputs(inputs: list[Path]) -> list[tuple[Path, Path]]:
   return files_to_process
 
 
-def process_paths(
-  inputs: list[Path],
-  output_dir: Path,
-  model_pack: str,
-  model_root: Path,
-  padding: float,
-  det_size: int,
-  det_thresh: float,
-):
-  obfuscator = FaceObfuscator(
-    model_pack=model_pack,
-    model_root=model_root,
-    padding=padding,
-    det_size=det_size,
-    det_thresh=det_thresh,
-  )
+def process_paths(inputs: list[Path], output_dir: Path, model_type: ModelType, **kwargs):
+  obfuscator = create_obfuscator(model_type, **kwargs)
   processor = MediaProcessor(obfuscator)
   files_to_process = resolve_inputs(inputs)
   output_dir = output_dir.resolve()
@@ -417,33 +630,51 @@ def process_paths(
 
 if __name__ == "__main__":
   parser = argparse.ArgumentParser(
-    description="Apply SCRFD-based face blur to images and videos while preserving video audio."
+    description="Apply AI face blur to images and videos while preserving metadata and audio."
   )
   parser.add_argument("-i", "--input", nargs="+", type=Path, required=True, help="Input file(s) or folder(s)")
   parser.add_argument("-o", "--output", type=Path, required=True, help="Output folder")
   parser.add_argument(
-    "--model-pack", default="buffalo_sc", help="InsightFace model pack name. buffalo_sc uses SCRFD-500MF."
+    "--model",
+    type=str,
+    choices=[e.value for e in ModelType],
+    default=ModelType.SCRFD.value,
+    help="Model to use for face detection",
+  )
+  parser.add_argument("--padding", type=float, default=0.3, help="Extra padding ratio around each detected face")
+  parser.add_argument(
+    "--yolo-model-path",
+    type=Path,
+    default=Path(__file__).resolve().parent / "model/yolov8n-face-lindevs.pt",
+    help="Path to YOLO model file (for YOLO)",
   )
   parser.add_argument(
-    "--model-root",
+    "--scrfd-model-pack",
+    default="buffalo_sc",
+    help="InsightFace model pack name (for SCRFD). buffalo_sc uses SCRFD-500MF.",
+  )
+  parser.add_argument(
+    "--scrfd-model-root",
     type=Path,
     default=Path(__file__).resolve().parent / "model/insightface",
-    help="Directory where InsightFace model packs are cached",
+    help="Directory where InsightFace model packs are cached (for SCRFD)",
   )
-  parser.add_argument("--padding", type=float, default=0.35, help="Extra padding ratio around each detected face")
-  parser.add_argument("--det-size", type=int, default=640, help="Detection input size, e.g. 640 or 800")
-  parser.add_argument("--det-thresh", type=float, default=0.35, help="Detection confidence threshold")
+  parser.add_argument("--det-size", type=int, default=640, help="Detection input size for SCRFD, e.g. 640 or 800")
+  parser.add_argument("--det-thresh", type=float, default=0.35, help="Detection confidence threshold for SCRFD")
 
   args = parser.parse_args()
   args.output.mkdir(parents=True, exist_ok=True)
 
-  process_paths(
-    inputs=args.input,
-    output_dir=args.output,
-    model_pack=args.model_pack,
-    model_root=args.model_root,
-    padding=args.padding,
-    det_size=args.det_size,
-    det_thresh=args.det_thresh,
-  )
+  model_type = ModelType(args.model)
+
+  kwargs = {
+    "padding": args.padding,
+    "yolo_model_path": args.yolo_model_path,
+    "scrfd_model_pack": args.scrfd_model_pack,
+    "scrfd_model_root": args.scrfd_model_root,
+    "det_size": args.det_size,
+    "det_thresh": args.det_thresh,
+  }
+
+  process_paths(inputs=args.input, output_dir=args.output, model_type=model_type, **kwargs)
   print("\nAll tasks completed successfully.")

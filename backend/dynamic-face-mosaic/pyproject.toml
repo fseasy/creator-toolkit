@@ -10,6 +10,7 @@ dependencies = [
   "numpy>=2.4.4",
   "onnxruntime>=1.24.4",
   "opencv-python>=4.13.0.92",
+  "piexif>=1.1.3",
   "tqdm>=4.67.3",
   "ultralytics>=8.4.36",
 ]
